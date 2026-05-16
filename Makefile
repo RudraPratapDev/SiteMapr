@@ -16,4 +16,4 @@ tidy:
 
 clean:
 	@echo "\033[1;31mCleaning up...\033[0m"
-	@rm -f $(APP_NAME) results.json results.csv
+	@rm -rf $(APP_NAME) results/ results.json results.csv
