@@ -37,7 +37,12 @@ You will be prompted to supply a starting URL, maximum concurrency limit, and ou
 
 SiteMapr relies on a modular separation of concerns.
 - `/scraper`: Handles network logic, XML node extraction, and concurrency mechanisms.
-- `/exporter`: Consumes structured datasets and serializes them to localized file caches. 
+- `/exporter`: Consumes structured datasets and serializes them to localized file caches.
+
+## 📊 Sample Output
+We have included a `sample_output/` folder in the repository so you can see exactly what SiteMapr provides without running it yourself. It contains:
+- `sample_data.json`: A small slice (about 20 records) of the typical `SeoData` extracted from a crawl.
+- `sample_logs.txt`: An example of how the background worker output safely logs requests without cluttering the interactive UI.
 
 ## ⚖️ License
 MIT. Go ahead—break it, bend it, mod it. 
