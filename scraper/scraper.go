@@ -1,7 +1,6 @@
 package scraper
 
 import (
-	"fmt"
 	"log"
 	"math/rand"
 	"net/http"
@@ -20,87 +19,84 @@ type SeoData struct {
 	StatusCode      int
 }
 
-type DefaultParser struct {
-}
+type DefaultParser struct{}
 
 type Parser interface {
 	GetSeoData(resp *http.Response) (SeoData, error)
 }
 
 var userAgents = []string{
-	// Chrome - Windows
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-
-	// Firefox - Windows
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0",
-
-	// Safari - macOS
 	"Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-
-	// Edge - Windows
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.2592.81",
 }
 
 var rnd = rand.New(rand.NewSource(time.Now().UnixNano()))
 
 func randUserAgent() string {
-	// pick a random user agent from the pool
-	randnum := rnd.Int() % len(userAgents)
-	return userAgents[randnum]
+	return userAgents[rnd.Int()%len(userAgents)]
 }
 
-// checks and splits a list of urls into sitemaps and standard pages
 func isSiteMap(urls []string) ([]string, []string) {
-	sitemapFiles := []string{}
+	sitemaps := []string{}
 	pages := []string{}
 	for _, page := range urls {
-		foundSitemap := strings.Contains(page, "xml")
-		if foundSitemap == true {
-			fmt.Println("Found sitemap,page")
-			sitemapFiles = append(sitemapFiles, page)
+		if strings.Contains(page, "xml") {
+			sitemaps = append(sitemaps, page)
 		} else {
 			pages = append(pages, page)
 		}
 	}
-	return sitemapFiles, pages
+	return sitemaps, pages
 }
 
-func extractSiteMapUrls(startUrl string) []string {
-	// unbuffered channel to orchestrate worklist tasks
-	Worklist := make(chan []string)
+func extractSiteMapUrls(startUrl string, concurrency int) []string {
+	// 1. Buffered channel solves deadlock risk by safely holding dynamic responses
+	Worklist := make(chan []string, 100000)
 	toCrawl := []string{}
 	var n int
 	n = 1
 	var mu sync.Mutex
-	go func() { Worklist <- []string{startUrl} }()
+
+	// 2. Limiting processing tokens to prevent RAM explosion
+	tokens := make(chan struct{}, concurrency)
+
+	Worklist <- []string{startUrl}
 
 	for ; n > 0; n-- {
 		list := <-Worklist
 		for _, link := range list {
 			n++
 			go func(link string) {
+				// 3. Guarantee exact 1-to-1 Worklist message per goroutine created to perfectly decrement `n`
+				var nextWork []string
+				defer func() {
+					Worklist <- nextWork
+				}()
+
+				// Hold semaphore over the ENTIRE job
+				tokens <- struct{}{}
+				defer func() { <-tokens }()
+
 				res, err := makeRequest(link)
 				if err != nil {
 					log.Printf("Error retriveing url:%s", link)
-					Worklist <- []string{}
 					return
 				}
 				urls, err := extractUrls(res)
 				if err != nil {
-					log.Printf("Error extracting documents from response url:%s", link)
-					Worklist <- []string{}
+					log.Printf("Error extracting documents url:%s", link)
 					return
 				}
+
 				siteMapFiles, pages := isSiteMap(urls)
-				if siteMapFiles != nil {
-					Worklist <- siteMapFiles
-				} else {
-					Worklist <- []string{}
+				if len(siteMapFiles) > 0 {
+					nextWork = siteMapFiles
 				}
+
 				mu.Lock()
-				for _, page := range pages {
-					toCrawl = append(toCrawl, page)
-				}
+				toCrawl = append(toCrawl, pages...)
 				mu.Unlock()
 			}(link)
 		}
@@ -110,43 +106,40 @@ func extractSiteMapUrls(startUrl string) []string {
 }
 
 func makeRequest(url string) (*http.Response, error) {
-	client := http.Client{
-		//dont want to overload the website so adding timeout
-		Timeout: 10 * time.Second,
-	}
+	client := http.Client{Timeout: 10 * time.Second}
 	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
 	req.Header.Set("User-Agent", randUserAgent())
-	if err != nil {
-		return nil, err
-	}
-
-	res, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	return res, err
+	return client.Do(req)
 }
 
 func scrapeUrls(urls []string, parser Parser, concurrency int) []SeoData {
-	// semaphore channel to limit the maximum number of concurrent requests
 	tokens := make(chan struct{}, concurrency)
 	var n int
 	n = 1
 	var mu sync.Mutex
-	Worklist := make(chan []string)
+	Worklist := make(chan []string, 100000)
 	results := []SeoData{}
-	go func() {
-		Worklist <- urls
-	}()
+
+	Worklist <- urls
 
 	for ; n > 0; n-- {
 		list := <-Worklist
 		for _, url := range list {
 			if url != "" {
 				n++
-				go func(url string, token chan struct{}) {
+				go func(url string) {
+					// Enforce strictly one reply per goroutine to keep `n` safe
+					defer func() { Worklist <- []string{} }()
+
+					// Hold semaphore for the entire page load + scrape process
+					tokens <- struct{}{}
+					defer func() { <-tokens }()
+
 					log.Printf("Requesting URL:%s", url)
-					res, err := scrapePage(url, tokens, parser)
+					res, err := scrapePage(url, parser)
 					if err != nil {
 						log.Printf("Encountered error URL:%s", url)
 					} else {
@@ -154,16 +147,15 @@ func scrapeUrls(urls []string, parser Parser, concurrency int) []SeoData {
 						results = append(results, res)
 						mu.Unlock()
 					}
-					Worklist <- []string{}
-				}(url, tokens)
+				}(url)
 			}
 		}
 	}
 	return results
 }
 
-func scrapePage(url string, tokens chan struct{}, parser Parser) (SeoData, error) {
-	res, err := crawlPage(url, tokens)
+func scrapePage(url string, parser Parser) (SeoData, error) {
+	res, err := makeRequest(url)
 	if err != nil {
 		return SeoData{}, err
 	}
@@ -174,18 +166,7 @@ func scrapePage(url string, tokens chan struct{}, parser Parser) (SeoData, error
 	return data, nil
 }
 
-func crawlPage(url string, tokens chan struct{}) (*http.Response, error) {
-	tokens <- struct{}{}
-	resp, err := makeRequest(url)
-	<-tokens
-	if err != nil {
-		return nil, err
-	}
-	return resp, err
-}
-
 func (d DefaultParser) GetSeoData(resp *http.Response) (SeoData, error) {
-	// close the response body when we are done
 	defer resp.Body.Close()
 
 	doc, err := goquery.NewDocumentFromReader(resp.Body)
@@ -202,7 +183,6 @@ func (d DefaultParser) GetSeoData(resp *http.Response) (SeoData, error) {
 }
 
 func extractUrls(resp *http.Response) ([]string, error) {
-	// close the response body when we are done
 	defer resp.Body.Close()
 
 	doc, err := goquery.NewDocumentFromReader(resp.Body)
@@ -210,19 +190,16 @@ func extractUrls(resp *http.Response) ([]string, error) {
 		return nil, err
 	}
 	results := []string{}
-	// find all <loc> tags in sitemap xml
 	sel := doc.Find("loc")
 	for i := range sel.Nodes {
 		loc := sel.Eq(i)
-		result := loc.Text()
-		results = append(results, result)
+		results = append(results, loc.Text())
 	}
 	return results, nil
 }
 
 func ScrapeSiteMap(url string, parser Parser, concurrency int) []SeoData {
-	results := extractSiteMapUrls(url)
-	//get structured data
+	results := extractSiteMapUrls(url, concurrency)
 	res := scrapeUrls(results, parser, concurrency)
 	return res
 }
